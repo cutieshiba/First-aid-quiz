@@ -21,14 +21,14 @@ def get_csv_export_url(sheet_url):
     gid = gid_match.group(1) if gid_match else '0'
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
-@st.cache_data # This prevents re-downloading the sheet every time you click a button
+@st.cache_data
 def load_data(url):
     csv_url = get_csv_export_url(url)
     with urllib.request.urlopen(csv_url) as response:
         csv_data = response.read().decode('utf-8')
     return pd.read_csv(io.StringIO(csv_data))
 
-# ==================== SESSION STATE (The Brain) ====================
+# ==================== SESSION STATE ====================
 if 'quiz_started' not in st.session_state:
     st.session_state.quiz_started = False
     st.session_state.current_index = 0
@@ -36,6 +36,10 @@ if 'quiz_started' not in st.session_state:
     st.session_state.questions = []
     st.session_state.answered = False
     st.session_state.feedback = None
+    st.session_state.wrong_questions = []  # Store indices of wrong answers
+    st.session_state.original_questions = []  # Store original full dataset
+    st.session_state.current_mode = None
+    st.session_state.question_numbers = []  # Store original question numbers for reference
 
 # ==================== UI: MAIN MENU ====================
 if not st.session_state.quiz_started:
@@ -50,23 +54,71 @@ if not st.session_state.quiz_started:
         df = load_data(YOUR_SHEET_URL)
         st.success(f"📚 {len(df)} Questions available!")
         
-        mode = st.selectbox("Select Mode:", ["Random Quiz (10 questions)", "Full Exam", "Custom Number"])
+        # Store original dataset for reference
+        st.session_state.original_questions = df.to_dict('records')
+        
+        mode = st.selectbox("Select Mode:", [
+            "Random Quiz (10 questions)", 
+            "Random Full Quiz", 
+            "Full Exam", 
+            "Custom Number",
+            "Custom Question Number",
+            "Review Wrong Questions"
+        ])
         
         num_q = 10
+        custom_question_num = None
+        
         if mode == "Custom Number":
             num_q = st.number_input("How many questions?", min_value=1, max_value=len(df), value=10)
-        elif mode == "Full Exam":
+        elif mode == "Custom Question Number":
+            custom_question_num = st.number_input("Enter Question Number (1-based index):", 
+                                                  min_value=1, max_value=len(df), value=1)
+        elif mode == "Review Wrong Questions":
+            if len(st.session_state.wrong_questions) == 0:
+                st.warning("⚠️ No wrong questions to review yet! Complete a quiz first to save wrong answers.")
+            else:
+                st.info(f"📝 You have {len(st.session_state.wrong_questions)} questions to review")
+        elif mode == "Random Full Quiz":
             num_q = len(df)
 
         if st.button("▶ START QUIZ", use_container_width=True):
-            # Prep questions
-            questions_pool = df.to_dict('records')
-            if "Random" in mode or mode == "Custom Number":
-                st.session_state.questions = random.sample(questions_pool, min(num_q, len(questions_pool)))
-            else:
-                st.session_state.questions = questions_pool
+            # Prep questions based on mode
+            questions_pool = st.session_state.original_questions
             
+            if mode == "Random Quiz (10 questions)":
+                st.session_state.questions = random.sample(questions_pool, min(num_q, len(questions_pool)))
+                st.session_state.current_mode = "random_quiz"
+            elif mode == "Random Full Quiz":
+                st.session_state.questions = random.sample(questions_pool, len(questions_pool))
+                st.session_state.current_mode = "random_full"
+            elif mode == "Full Exam":
+                st.session_state.questions = questions_pool.copy()
+                st.session_state.current_mode = "full_exam"
+            elif mode == "Custom Number":
+                st.session_state.questions = random.sample(questions_pool, min(num_q, len(questions_pool)))
+                st.session_state.current_mode = "custom_number"
+            elif mode == "Custom Question Number":
+                # Get specific question by number
+                specific_q = [questions_pool[custom_question_num - 1]]
+                st.session_state.questions = specific_q
+                st.session_state.current_mode = "custom_question"
+            elif mode == "Review Wrong Questions":
+                if len(st.session_state.wrong_questions) > 0:
+                    # Get the wrong questions from original dataset
+                    wrong_qs = [questions_pool[idx] for idx in st.session_state.wrong_questions]
+                    st.session_state.questions = wrong_qs
+                    st.session_state.current_mode = "review"
+                else:
+                    st.error("No wrong questions to review!")
+                    st.stop()
+            
+            # Reset quiz state
             st.session_state.quiz_started = True
+            st.session_state.current_index = 0
+            st.session_state.score = 0
+            st.session_state.answered = False
+            st.session_state.feedback = None
             st.rerun()
 
     except Exception as e:
@@ -81,9 +133,25 @@ else:
     if idx < len(q_list):
         q = q_list[idx]
         
-        # Progress bar
+        # Find original question number if available
+        original_num = None
+        if st.session_state.original_questions:
+            try:
+                original_num = st.session_state.original_questions.index(q) + 1
+            except ValueError:
+                original_num = idx + 1
+        
+        # Progress bar with question number
         st.progress((idx) / len(q_list))
         st.write(f"**Question {idx + 1} of {len(q_list)}**")
+        
+        # Display Question Number prominently
+        if original_num:
+            st.markdown(f"""
+                <div style="background: #2196F3; color: white; padding: 5px 15px; border-radius: 20px; display: inline-block; margin-bottom: 10px;">
+                    <b>📌 Question #{original_num}</b>
+                </div>
+                """, unsafe_allow_html=True)
 
         # Display Question
         st.markdown(f"""
@@ -112,20 +180,39 @@ else:
                 selected_letter = opts[user_choice]
                 correct_letter = str(q['Correct Answer']).strip()
                 
+                # Find original index for wrong questions tracking
+                original_idx = None
+                if st.session_state.original_questions:
+                    try:
+                        original_idx = st.session_state.original_questions.index(q)
+                    except ValueError:
+                        original_idx = idx
+                
                 if selected_letter == correct_letter:
                     st.session_state.score += 1
                     st.session_state.feedback = ("success", "✅ CORRECT! Great job!")
                 else:
                     correct_text = q[f'Option {correct_letter}']
                     st.session_state.feedback = ("error", f"❌ INCORRECT. The correct answer was **{correct_letter}: {correct_text}**")
+                    
+                    # Save wrong question if we have original index and not in review mode
+                    if original_idx is not None and st.session_state.current_mode != "review":
+                        if original_idx not in st.session_state.wrong_questions:
+                            st.session_state.wrong_questions.append(original_idx)
             else:
                 st.warning("Please select an answer first!")
 
         # Show Feedback
         if st.session_state.feedback:
             type, msg = st.session_state.feedback
-            if type == "success": st.success(msg)
-            else: st.error(msg)
+            if type == "success": 
+                st.success(msg)
+            else: 
+                st.error(msg)
+                
+                # Show additional learning tip
+                if "correct answer" in msg.lower():
+                    st.info("💡 Tip: Take note of this question for future review!")
 
         # NEXT BUTTON
         if col2.button("➡ NEXT QUESTION", disabled=not st.session_state.answered, use_container_width=True):
@@ -133,6 +220,22 @@ else:
             st.session_state.answered = False
             st.session_state.feedback = None
             st.rerun()
+        
+        # Show wrong questions count in sidebar
+        with st.sidebar:
+            st.markdown("### 📊 Quiz Stats")
+            st.metric("Current Score", f"{st.session_state.score}/{idx + 1 if st.session_state.answered else idx}")
+            st.metric("Wrong Questions Saved", len(st.session_state.wrong_questions))
+            
+            if st.session_state.wrong_questions:
+                st.markdown("#### 📝 Wrong Question Numbers:")
+                wrong_nums = sorted([w + 1 for w in st.session_state.wrong_questions])
+                st.write(f"{', '.join(map(str, wrong_nums[:10]))}" + 
+                        ("..." if len(wrong_nums) > 10 else ""))
+            
+            if st.button("🔄 Reset Wrong Questions"):
+                st.session_state.wrong_questions = []
+                st.success("Wrong questions reset!")
 
     # ==================== UI: RESULTS ====================
     else:
@@ -149,8 +252,28 @@ else:
             </div>
             """, unsafe_allow_html=True)
         
-        if st.button("🔄 Restart Quiz"):
-            st.session_state.quiz_started = False
-            st.session_state.current_index = 0
-            st.session_state.score = 0
-            st.rerun()
+        # Show wrong questions summary
+        if st.session_state.wrong_questions and st.session_state.current_mode != "review":
+            st.markdown("### 📝 Questions to Review:")
+            wrong_nums = sorted([w + 1 for w in st.session_state.wrong_questions])
+            st.write(f"You got **{len(wrong_nums)}** questions wrong. Question numbers: **{', '.join(map(str, wrong_nums))}**")
+            st.info("💡 Go back to the main menu and select 'Review Wrong Questions' mode to practice these specific questions!")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔄 Restart Same Quiz", use_container_width=True):
+                # Reset quiz state but keep same questions
+                st.session_state.current_index = 0
+                st.session_state.score = 0
+                st.session_state.answered = False
+                st.session_state.feedback = None
+                st.rerun()
+        
+        with col2:
+            if st.button("🏠 Main Menu", use_container_width=True):
+                st.session_state.quiz_started = False
+                st.session_state.current_index = 0
+                st.session_state.score = 0
+                st.session_state.current_mode = None
+                st.rerun()
